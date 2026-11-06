@@ -1,0 +1,173 @@
+# Corre las pruebas de Bancada IT en macOS, con la app de verdad.
+#
+# QUÉ HACE: descifra el código, corre las pruebas unitarias de la lista cifrada
+# (pruebas/ci-lista.json) en Node y, si el recorrido de punta a punta
+# (pruebas/e2e.js) vino en su paquete aparte, lo corre manejando la app real. Hoy
+# ese paquete no existe en este proyecto, así que esta corrida valida solo las
+# unitarias; la comprobación de que la rama de Mac de la interfaz está activa (marca
+# de plataforma, lugar de los semáforos) la hace «Probar en Mac» sobre el .app firmado.
+#
+# POR QUÉ ASÍ:
+#   · El repo es PÚBLICO (por los minutos de macOS) y el código del producto no
+#     puede estar en claro. Se descifra acá, adentro del runner, con el secret.
+#   · Los logs de un repo público los lee cualquiera, y las pruebas repiten
+#     reglas de negocio en su salida. Por eso cada prueba manda su salida a un
+#     archivo y a la consola sólo va un renglón por prueba; el detalle, las
+#     capturas y los PDF se suben SELLADOS y se abren localmente con `abrir`.
+#
+# NO corre en pull_request: un fork no recibe los secrets y, además, no hay
+# que ejecutar código ajeno con la clave a mano.
+name: Pruebas en Mac
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pruebas-mac
+  cancel-in-progress: true
+
+jobs:
+  probar:
+    # macos-15 es Apple Silicon y tiene sesión gráfica: Electron puede abrir
+    # ventana. Lo que NO está verificado es que el runner le dé foco a la
+    # ventana para teclas reales: solo importa si algún día se suma el recorrido de
+    # punta a punta (pruebas/e2e.js).
+    runs-on: macos-15
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tiene que estar la clave del código
+        env:
+          BANCADA_CONTENIDO_KEY: ${{ secrets.BANCADA_CONTENIDO_KEY }}
+        run: |
+          [ -n "$BANCADA_CONTENIDO_KEY" ] || { echo "Falta el secret BANCADA_CONTENIDO_KEY."; exit 1; }
+          echo "Clave presente."
+
+      # Node 22 y no el del sistema: los tests usan import/export sin
+      # package.json "type: module" y dependen de la detección de módulos, y
+      # Electron 43 exige Node >= 22.12.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Descifrar el código del producto
+        env:
+          BANCADA_CONTENIDO_KEY: ${{ secrets.BANCADA_CONTENIDO_KEY }}
+        run: |
+          set -e
+          # Descifra los dos paquetes: el código (app.mfenc) y las pruebas unitarias
+          # (pruebas.mfenc, con su lista pruebas/ci-lista.json).
+          node scripts/contenido-cifrado.mjs descifrar
+          # El recorrido de punta a punta, que maneja la ventana, viaja en un
+          # paquete aparte y opcional (se arma con `sellar`, de scripts/contenido-cifrado.mjs).
+          if [ -f contenido-cifrado/e2e.mfenc ]; then
+            node scripts/contenido-cifrado.mjs abrir contenido-cifrado/e2e.mfenc .
+          fi
+          if [ ! -f main.js ] || [ ! -f preload.js ] || [ ! -f src/index.html ]; then
+            echo "El descifrado no dejó main.js, preload.js y src/."
+            exit 1
+          fi
+          [ -f pruebas/ci-lista.json ] || { echo "No está la lista de pruebas unitarias."; exit 1; }
+          # El recorrido de punta a punta es opcional: sólo corre si el paquete
+          # contenido-cifrado/e2e.mfenc lo trajo. Sin él, esta corrida valida los
+          # unitarios y avisa en vez de cortar.
+          [ -f pruebas/e2e.js ] || echo "Aviso: no está pruebas/e2e.js; se saltea el recorrido de punta a punta."
+          echo "Código descifrado."
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Guardar el binario de Electron entre corridas
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/electron
+          key: electron-mac-${{ hashFiles('package-lock.json') }}
+
+      # Un renglón por prueba, con su número y no con su nombre. La salida completa
+      # va a un archivo que sólo sale del runner sellado.
+      - name: Tests unitarios
+        env:
+          BANCADA_LOGS_PRUEBAS: ${{ runner.temp }}/evidencia/unitarios
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidencia/unitarios"
+          node --no-warnings scripts/correr-pruebas-ci.mjs
+
+      - name: Diagnóstico gráfico (sólo informativo)
+        continue-on-error: true
+        run: |
+          sw_vers
+          echo "sesión: $(launchctl managername 2>&1)"
+          pgrep -x WindowServer >/dev/null && echo "WindowServer: activo" || echo "WindowServer: NO está"
+          system_profiler SPDisplaysDataType 2>/dev/null | grep -E 'Resolution|UI Looks' || true
+
+      # Sin --rapido: se espera la vuelta del autoguardado de verdad, que es lo
+      # que el acto 2 recupera después del cierre sucio. El código de salida
+      # del arnés ya vale 1 ante cualquier falla o flujo que no dejó rastro.
+      - name: Recorrido de punta a punta
+        if: hashFiles('pruebas/e2e.js') != ''
+        timeout-minutes: 15
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/evidencia"
+          # Electron 43 ya no baja su binario al instalar: lo baja la primera vez
+          # que se le pide la ruta, e imprime "Downloading Electron binary..." en
+          # la misma salida. Si eso pasa dentro de $(...), el aviso se cuela en la
+          # ruta y el comando sale con 127. Por eso se instala antes, aparte y con
+          # reintentos, y recién después se le pregunta la ruta.
+          OK=0
+          for I in 1 2 3; do
+            if env -u ELECTRON_RUN_AS_NODE node node_modules/electron/install.js; then OK=1; break; fi
+            echo "Descarga de Electron: intento $I fallido."
+            sleep $((I * 15))
+          done
+          [ "$OK" = 1 ] || { echo "No se pudo bajar Electron."; exit 1; }
+          # La ruta del binario la resuelve el propio paquete `electron`
+          # (en macOS es Electron.app/Contents/MacOS/Electron).
+          ELECTRON=$(env -u ELECTRON_RUN_AS_NODE node -p "require('electron')" | tail -n 1)
+          [ -x "$ELECTRON" ] || { echo "No existe el binario de Electron: $(basename "$ELECTRON")"; exit 1; }
+          echo "Electron: $(basename "$ELECTRON")"
+          set +e
+          env -u ELECTRON_RUN_AS_NODE "$ELECTRON" pruebas/e2e.js \
+            > "$RUNNER_TEMP/evidencia/e2e.log" 2>&1
+          C=$?
+          set -e
+          echo "e2e exit=$C"
+          # Sólo el resumen: renglones de flujo y de totales, sin datos de dominio.
+          grep -E '^  (PASA|FALLA|PARCIAL) +[0-9]|flujos pasan|comprobaciones en verde|RESULTADO|entorno:' \
+            "$RUNNER_TEMP/evidencia/e2e.log" | cut -c1-110 || true
+          exit $C
+
+      # Se corre siempre: justamente cuando algo falla es cuando hacen falta.
+      - name: Sellar la evidencia
+        if: always()
+        env:
+          BANCADA_CONTENIDO_KEY: ${{ secrets.BANCADA_CONTENIDO_KEY }}
+        run: |
+          set -e
+          E="$RUNNER_TEMP/evidencia"
+          mkdir -p "$E" sellado
+          # El arnés escribe capturas, documentos y resultados bajo bancada-e2e.
+          if [ -d "$RUNNER_TEMP/bancada-e2e" ]; then
+            mkdir -p "$E/e2e"
+            cp -R "$RUNNER_TEMP/bancada-e2e/capturas" "$E/e2e/" 2>/dev/null || true
+            cp -R "$RUNNER_TEMP/bancada-e2e/salida" "$E/e2e/" 2>/dev/null || true
+            cp -R "$RUNNER_TEMP/bancada-e2e/resultados" "$E/e2e/" 2>/dev/null || true
+          fi
+          # Los unitarios de plantillas escriben su salida dentro del árbol.
+          if [ -d pruebas/salida ]; then cp -R pruebas/salida "$E/unitarios-salida"; fi
+          node scripts/contenido-cifrado.mjs sellar "$E" sellado/evidencia-pruebas-mac.mfenc
+
+      - name: Subir la evidencia sellada
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pruebas-mac-evidencia
+          path: sellado/evidencia-pruebas-mac.mfenc
+          if-no-files-found: error
+          retention-days: 7
