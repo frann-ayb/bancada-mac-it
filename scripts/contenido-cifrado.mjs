@@ -62,7 +62,7 @@
  */
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -409,7 +409,18 @@ function cmdAbrir(entrada, destino) {
   console.log(`✓ ${entrada} → ${destino}`)
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// ¿Se ejecutó este archivo directamente? Las dos rutas se comparan ya resueltas:
+// en macOS la carpeta temporal (/var/folders/...) es un enlace a /private/var/...
+// y, sin resolver el enlace, la comparación daba falso y el script salía sin hacer nada.
+const esPrincipal = (() => {
+  try {
+    return !!process.argv[1] && realpathSync(resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url))
+  } catch {
+    return false
+  }
+})()
+
+if (esPrincipal) {
   const { claveArchivo, destino, forzar, posicionales } = opciones(process.argv.slice(2))
   claveArchivoOpcion = claveArchivo ? resolve(claveArchivo) : null
   const [cmd, a, b] = posicionales
